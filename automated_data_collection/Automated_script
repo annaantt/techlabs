@@ -1,0 +1,151 @@
+# import relevant libraries
+import schedule
+import tweepy
+import pandas as pd
+import time
+import yfinance as yf
+from datetime import datetime
+import pandas as pd
+import time
+import re
+import nltk
+nltk.download('stopwords')
+nltk.download('punkt')
+nltk.download('wordnet')
+from nltk import word_tokenize
+from nltk.corpus import stopwords
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# set up Twitter API
+api_key = '8J1Xhsz5CpJ03ZgKU6lIaUSn0'
+api_key_secret = '21sGnOEoPkr1C3LHvQkngqPrz2b4H1XJ80rwOdzf4GQLOQoU4y'
+access_token = '728490112204558336-nkbo0b0p4l5DuP9NRkriAoVgqPvAZOj'
+access_token_secret = 'tmsyHjL0TtxhwcciXZt8XqzxoHr7DWueOaCaMuiFd4ju2'
+auth = tweepy.OAuthHandler(api_key, api_key_secret)
+auth.set_access_token(access_token, access_token_secret)
+api = tweepy.API(auth,wait_on_rate_limit=True)
+public_tweets = api.home_timeline()
+
+# specify search word names, tickers and numbers of tweets to scrape
+searchword1_name = 'uniswap'
+searchword1_ticker = 'UNI1-USD'
+searchword1_tcap = 12000
+
+searchword2_name = 'litecoin'
+searchword2_ticker = 'LTC-USD'
+searchword2_tcap = 10000
+
+searchword3_name = 'dogecoin'
+searchword3_ticker = 'DOGE-USD'
+searchword2_tcap = 60000
+
+# create lists to iterate through
+swnames = [searchword1_name, searchword2_name, searchword3_name]
+swtickers = [searchword1_ticker, searchword2_ticker, searchword3_ticker]
+swtcap = [searchword1_tcap, searchword2_tcap, searchword2_tcap]
+
+# count number of iterations for while loop based on number of search words
+iterations = len(swnames)
+
+# define frequency for running scheduled task (hrs)
+frequency = 24
+
+# define scheduled job
+def job():
+    # get current date
+    d = datetime.today()
+    d = d.strftime('%Y-%m-%d')
+
+    # define iterator for while loop
+    iterator = 0
+    
+    # define while loop
+    while iterator < iterations:
+        # scrape Twitter for tweets containing search word
+        df = pd.DataFrame()
+        tweets = tweepy.Cursor(api.search_tweets,q = swnames[iterator], until = d).items(swtcap[iterator])
+        try:
+            for tweet in tweets:
+                df = df.append(
+                                    {'Created at' : tweet._json['created_at'],
+                                                'User ID': tweet._json['id'],
+                                        'User Name': tweet.user._json['name'],
+                                                'Text': tweet._json['text'],
+                                'Description': tweet.user._json['description'],
+                                    'Location': tweet.user._json['location'],
+                        'Followers Count': tweet.user._json['followers_count'],
+                            'Friends Count': tweet.user._json['friends_count'],
+                        'Statuses Count': tweet.user._json['statuses_count'],
+                    'Profile Image Url': tweet.user._json['profile_image_url'],
+                                    }, ignore_index=True)
+        except BaseException as e:
+            print('failed on_status,',str(e))
+            time.sleep(3)
+
+        # preprocess search word tweets
+        df.rename(columns={'Created at':'timestamp','User ID':'id','Text': 'text'}, inplace=True)
+        df["timestamp"] = df["timestamp"].astype('datetime64[ns]') 
+        df["timestamp"] = df.timestamp.dt.to_pydatetime()
+        df = df[~df.text.str.contains("GIVEAWAY")]
+        df = df[~df.text.str.contains("FREE")]
+        df = df[~df.text.str.contains("giveaway")]
+        df = df[~df.text.str.contains("free")]
+        df.text = df.text.str.replace('\d+', '')
+        df.text = df.text.str.lower()
+        df.text = df.text.apply(lambda x:re.sub(r"http\S+", "", str(x)))
+        df.text = df.text.apply(lambda x:re.sub('@[^\s]+','',str(x)))
+        df.text = df.text.apply(lambda x:' '.join(re.findall(r'\w+', x)))
+        df.text = df.text.apply(lambda x:re.sub(r'\s+[a-zA-Z]\s+',' ', x))
+        df.text = df.text.apply(lambda x:re.sub(r'\s+', ' ', x, flags=re.I))
+        stop = stopwords.words('english')
+        df.text = df.text.apply(lambda x: ' '.join([word for word in word_tokenize(x) if word not in (stop)]))
+
+        # run sentiment analysis
+        sid = SentimentIntensityAnalyzer()
+        def get_sentiment(row, **kwargs):
+            sentiment_score = sid.polarity_scores(row)
+            positive_meter = (sentiment_score['pos'])
+            negative_meter = (sentiment_score['neg'])
+            return positive_meter if kwargs['k'] == 'positive' else negative_meter
+        df['positive'] = df.text.apply(get_sentiment, k='positive')
+        df['negative'] = df.text.apply(get_sentiment, k='negative')
+        df["sentiment"] = df["positive"] - df["negative"]
+
+        # aggregate tweets by the day
+        df.rename(columns={'id': 'numberoftweets'}, inplace=True)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.resample('D', on='timestamp').agg({'numberoftweets':'nunique','sentiment':'mean'})
+        df = df.reset_index()
+        df.reset_index(inplace=True)
+        df.drop('index', axis=1, inplace=True)
+
+        # scrape Yahoo for ticker price data
+        dfp = yf.download(tickers=swtickers[iterator], start = d, end = d)
+
+        # can maybe be deleted
+        dfp = dfp.reset_index()
+        dfp.reset_index(inplace=True)
+        dfp.drop('index', axis=1, inplace=True)
+
+        # join price df with twitter df
+        dfp.rename(columns={'Date': 'timestamp'}, inplace=True)
+        df = pd.merge(df, dfp, on='timestamp',  how='right')
+
+        # add search name to df
+        df['Cryptocurrency'] = swnames[iterator]
+
+        # save df to csv file
+        df.to_csv('testdb.csv', encoding='utf-8', index=False, mode='a', header=False)
+
+        print("Done collecting {} data".format(swnames[iterator]))
+        iterator +=1
+        print(iterator)
+
+    print("Completed scheduled task")
+schedule.every(frequency).hours.do(job)
+
+while True:
+    schedule.run_pending()
+    time.sleep(1)
+
+
